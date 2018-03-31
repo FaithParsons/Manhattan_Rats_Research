@@ -1,0 +1,177 @@
+---
+title: "Process PADAR Data"
+author: "Faith E Parsons"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readr)
+library(janitor)
+library(lubridate)
+library(data.table)
+library(ggplot2)
+library(scales)
+library(ggthemes)
+library(plotly)
+
+options(digits.secs=4)
+# Create a vector containing filenames of all CSVs
+csv_files = list.files(path = "../../PADAR Data/", pattern = "*.CSV") %>% as_tibble() %>%
+  mutate(fname = paste0("../../PADAR Data/", value)) %>%
+  select(fname) %>% as_vector()
+
+# Manually read one CSV file at a time
+tempfile = read.csv("../../PADAR Data/033_20180115T120001.CSV", 
+                    col.names = c("timestamp", "tz", "serial_state", "antenna", "RFID", "rh_pct", "temp_c"),
+                    colClasses = c("character", "factor", "factor", "factor", "factor", "numeric", "numeric")) %>%
+  mutate(timestamp = as.POSIXct(timestamp)) 
+
+# Function to read all csv files
+read_padar = function(csvfile) {
+  padar_data = read.csv(csvfile, 
+                    col.names = c("timestamp", "tz", "serial_state", "antenna", "RFID", "rh_pct", "temp_c"),
+                    colClasses = c("character", "character", "character", "character", "character", "numeric", "numeric")) %>%
+  mutate(timestamp = as.POSIXct(timestamp))
+  return(padar_data)
+}
+# Create a blank list
+output_data = vector("list", length(csv_files))
+# Iterate across all csv files
+for (i in 1:length(csv_files)) {
+  output_data[[i]] = read_padar(csv_files[i])
+}
+# Create final merged dataset
+padar_data = bind_rows(output_data)
+
+
+#===============================================+#
+
+# Separate the rel. humidity and temp variables from RFID data
+
+humid_temp = filter(padar_data, !is.na(rh_pct) | !is.na(temp_c)) %>%
+  select(timestamp, rh_pct, temp_c)
+
+rfid_data = filter(padar_data, RFID != "") %>%
+  filter(RFID != "00000000") %>%
+  select(-rh_pct, -temp_c) %>%
+  arrange(RFID, antenna, timestamp) %>%
+  group_by(RFID, antenna) %>%
+  mutate(timestamp2 = lag(timestamp,1),
+         timediff = difftime(timestamp , timestamp2, units="secs")) %>%
+  select(RFID, antenna, timestamp, timestamp2, timediff, everything()) %>%
+  ungroup() %>%
+  data.table()
+
+# Remove duplicate readings
+rfid_data_unique = unique(rfid_data, by =c("RFID", "antenna", "timestamp"))
+
+
+# Create a visit_chunk identifier which is essentially a group number by RFID, and antenna
+rfid_data_unique = rfid_data_unique %>% 
+  arrange(RFID, antenna, timestamp) %>%
+  data.table()
+setkey(rfid_data_unique, RFID, antenna)
+
+rfid_data_unique[ , visit_chunk := .GRP, by = key(rfid_data_unique)]
+
+rfid_final = rfid_data_unique %>%
+  group_by(visit_chunk) %>%
+  mutate(count = n())
+
+View(rfid_final)
+
+
+```
+
+
+```{r}
+
+plot_ly(data = rfid_final, x = ~timestamp, y = ~RFID, type = "scatter" )
+
+# Graph all
+  ggplot(rfid_final, aes(y = RFID, x = timestamp)) +
+    geom_point(size = 0.5) +
+    labs(x = "Date/time", y = "Antenna") +
+    scale_x_datetime(breaks = date_breaks("1 days"), labels = date_format("%m-%d %H:%M:%S")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=90)) +
+    facet_grid(antenna ~ .)
+  
+ # Graph all
+  ggplot(rfid_final, aes(y = RFID, x = timestamp)) +
+    geom_point(size = 1) +
+    labs(x = "Date/time", y = "Antenna") +
+    scale_x_datetime(breaks = date_breaks("1 days"), labels = date_format("%m-%d %H:%M:%S")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=90)) 
+
+
+    
+# Select RFIDs
+
+ftable(rfid_final$RFID)  
+rfid_toviz = rfid_final %>% filter(RFID == "4AE4EFEB")
+rfid_toviz %>%
+  ggplot(aes(y = antenna, x = timestamp)) +
+    geom_point(size = 0.5) +
+    labs(x = "Date/time", y = "Antenna") +
+    scale_x_datetime(labels = date_format("%m-%d %H:%M:%S")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=90)) +
+    facet_grid(antenna ~ .)
+
+start_date = as.Date(min(rfid_toviz$timestamp))
+end_date = as.Date(max(rfid_toviz$timestamp))
+mean_date = mean(rfid_toviz$timestamp)
+
+max(rfid_toviz$timestamp) - min(rfid_toviz$timestamp)
+
+ll = min(rfid_toviz$timestamp - 60)
+mean_date
+ul = max(rfid_toviz$timestamp + 20)
+
+ll
+mean_date 
+ul
+
+
+
+rfid_toviz %>%
+  ggplot(aes(y = antenna, x = timestamp)) +
+    geom_point(size = 0.5) +
+    labs(x = "Date/time", y = "Antenna") +
+    scale_x_datetime(limits = c(ll, ul), breaks = date_breaks("1 mins"), labels = date_format("%m-%d %H:%M:%S")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=90))
+
+```
+
+```{r visit_length}
+
+rfid_visit = rfid_final %>% 
+  select(-serial_state, -tz,) %>%
+  mutate(to_delete = ifelse(is.na(timediff) & count > 1, 1, 0)) %>%
+  filter(to_delete == 0) %>%
+  mutate(new_visit = ifelse(is.na(timediff) | timediff <= 5, 0, 1)) %>%
+  ungroup() %>%
+  mutate(inc_visit = cumsum(new_visit),
+         new_chunk = visit_chunk + inc_visit)
+  
+rfid_visit = rfid_final %>% 
+  arrange(RFID, antenna, timestamp) %>%
+  select(-serial_state, -tz) %>%
+  mutate(new_visit = ifelse(is.na(timediff) | timediff > 5, 1, 0),
+         new_visit = ifelse(is.na(new_visit), 1, new_visit)) %>%
+  ungroup() %>%
+  mutate(inc_visit = cumsum(new_visit))
+
+  View(rfid_visit)
+
+
+
+```
+
+
