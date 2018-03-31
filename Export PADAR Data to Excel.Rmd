@@ -59,6 +59,7 @@ View(padar_data_unique)
 
 humid_temp = filter(padar_data, !is.na(rh_pct) | !is.na(temp_c)) %>%
   select(timestamp, rh_pct, temp_c)
+humid_temp_unique = unique(humid_temp)
 
 rfid_data = filter(padar_data, RFID != "") %>%
   filter(RFID != "00000000") %>%
@@ -66,8 +67,6 @@ rfid_data = filter(padar_data, RFID != "") %>%
   # Exclude test RFIDs
   filter(!(RFID %in% c("486F2058", "2205557D", "486F283F", "22053F6C")))
   arrange(RFID, antenna, timestamp) #%>%
-  
-  
   
   # group_by(RFID, antenna) %>%
   # mutate(timestamp2 = lag(timestamp,1),
@@ -83,112 +82,51 @@ rfid_data_unique = unique(rfid_data, by =c("RFID", "antenna", "timestamp"))
 ftable(rfid_data_unique$RFID)
 # Export to Excel
 library(xlsx)
-write.xlsx(mydata, "c:/mydata.xlsx")
 
+
+rfid_data_unique$timestamp = force_tz(rfid_data_unique$timestamp, tzone = "UTC")
+write.xlsx(rfid_data_unique, "../Private/PADAR RFID data as of 2018_03_14.xlsx")
+
+humid_temp_unique$timestamp = force_tz(humid_temp_unique$timestamp, tzone="UTC")
+write.xlsx(humid_temp_unique, "../Private/PADAR humid_temp as of 2018_03_14.xlsx")
+
+```
+
+```{r compute_duration}
+# If duration > 60 secs then unique visit
+
+rfid_dur <- rfid_data_unique %>%
+  # Remove tz and serialstate
+  select(-tz, - serial_state) %>%
+  arrange(RFID, antenna, timestamp) %>%
+  group_by(RFID, antenna) %>%
+  mutate(timestamp2 = lag(timestamp,1),
+         timediff = difftime(timestamp , timestamp2, units="secs")) %>%
+  select(RFID, antenna, timestamp, timestamp2, timediff, everything()) %>%
+  ungroup() %>%
+  data.table() 
+View(rfid_dur)
 
 # Create a visit_chunk identifier which is essentially a group number by RFID, and antenna
-rfid_data_unique = rfid_data_unique %>% 
+rfid_dur = rfid_dur %>% 
   arrange(RFID, antenna, timestamp) %>%
   data.table()
-setkey(rfid_data_unique, RFID, antenna)
+setkey(rfid_dur, RFID, antenna)
 
-rfid_data_unique[ , visit_chunk := .GRP, by = key(rfid_data_unique)]
+rfid_dur[ , visit_chunk := .GRP, by = key(rfid_dur)]
 
-rfid_final = rfid_data_unique %>%
+rfid_final = rfid_dur %>%
   group_by(visit_chunk) %>%
-  mutate(count = n())
-
-View(rfid_final)
-
-
-```
-
-
-```{r}
-
-plot_ly(data = rfid_final, x = ~timestamp, y = ~RFID, type = "scatter" )
-
-# Graph all
-  ggplot(rfid_final, aes(y = RFID, x = timestamp)) +
-    geom_point(size = 0.5) +
-    labs(x = "Date/time", y = "Antenna") +
-    scale_x_datetime(breaks = date_breaks("1 days"), labels = date_format("%m-%d %H:%M:%S")) +
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle=90)) +
-    facet_grid(antenna ~ .)
-  
- # Graph all
-  ggplot(rfid_final, aes(y = RFID, x = timestamp)) +
-    geom_point(size = 1) +
-    labs(x = "Date/time", y = "Antenna") +
-    scale_x_datetime(breaks = date_breaks("1 days"), labels = date_format("%m-%d %H:%M:%S")) +
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle=90)) 
-
-
-    
-# Select RFIDs
-
-ftable(rfid_final$RFID)  
-rfid_toviz = rfid_final %>% filter(RFID == "4AE4EFEB")
-rfid_toviz %>%
-  ggplot(aes(y = antenna, x = timestamp)) +
-    geom_point(size = 0.5) +
-    labs(x = "Date/time", y = "Antenna") +
-    scale_x_datetime(labels = date_format("%m-%d %H:%M:%S")) +
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle=90)) +
-    facet_grid(antenna ~ .)
-
-start_date = as.Date(min(rfid_toviz$timestamp))
-end_date = as.Date(max(rfid_toviz$timestamp))
-mean_date = mean(rfid_toviz$timestamp)
-
-max(rfid_toviz$timestamp) - min(rfid_toviz$timestamp)
-
-ll = min(rfid_toviz$timestamp - 60)
-mean_date
-ul = max(rfid_toviz$timestamp + 20)
-
-ll
-mean_date 
-ul
-
-
-
-rfid_toviz %>%
-  ggplot(aes(y = antenna, x = timestamp)) +
-    geom_point(size = 0.5) +
-    labs(x = "Date/time", y = "Antenna") +
-    scale_x_datetime(limits = c(ll, ul), breaks = date_breaks("1 mins"), labels = date_format("%m-%d %H:%M:%S")) +
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle=90))
-
-```
-
-```{r visit_length}
-
-rfid_visit = rfid_final %>% 
-  select(-serial_state, -tz,) %>%
-  mutate(to_delete = ifelse(is.na(timediff) & count > 1, 1, 0)) %>%
-  filter(to_delete == 0) %>%
-  mutate(new_visit = ifelse(is.na(timediff) | timediff <= 5, 0, 1)) %>%
+  mutate(num_visits = n()) %>% 
   ungroup() %>%
-  mutate(inc_visit = cumsum(new_visit),
-         new_chunk = visit_chunk + inc_visit)
-  
-rfid_visit = rfid_final %>% 
-  arrange(RFID, antenna, timestamp) %>%
-  select(-serial_state, -tz) %>%
-  mutate(new_visit = ifelse(is.na(timediff) | timediff > 5, 1, 0),
-         new_visit = ifelse(is.na(new_visit), 1, new_visit)) %>%
-  ungroup() %>%
-  mutate(inc_visit = cumsum(new_visit))
-
-  View(rfid_visit)
-
+  mutate(timediff = difftime(timestamp, timestamp2, units = "secs"),
+         timediff_next = lead(timediff)) %>%
+  select(RFID, antenna, timestamp, timestamp2, timediff, timediff_next, everything()) %>%
+  mutate(duration = ifelse(num_visits == 1, 0.1,
+                           ifelse(is.na(timediff) & timediff_next > 60, 0.1, 
+                                  ifelse(timediff_next > 60, NA, timediff_next)))) %>%
+  View
 
 
 ```
-
 

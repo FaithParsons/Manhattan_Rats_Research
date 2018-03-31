@@ -1,0 +1,171 @@
+---
+title: "Process PADAR Data"
+author: "Faith E Parsons"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readr)
+library(janitor)
+library(lubridate)
+library(data.table)
+library(ggplot2)
+library(scales)
+library(ggthemes)
+library(plotly)
+
+options(digits.secs=4)
+# Create a vector containing filenames of all CSVs
+# Includes all data except 1/23/2018 
+csv_files = list.files(path = "../Private/PADAR Data/", pattern = "*.CSV") %>% as_tibble() %>%
+  mutate(fname = paste0("../Private/PADAR Data/", value)) %>%
+  select(fname) %>% as_vector()
+
+# Manually read one CSV file at a time
+tempfile = read.csv("../Private/PADAR Data/033_20180115T120001.CSV", 
+                    col.names = c("timestamp", "tz", "serial_state", "antenna", "RFID", "rh_pct", "temp_c"),
+                    colClasses = c("character", "factor", "factor", "factor", "factor", "numeric", "numeric")) %>%
+  mutate(timestamp = as.POSIXct(timestamp)) 
+
+# Function to read all csv files
+read_padar = function(csvfile) {
+  padar_data = read.csv(csvfile, 
+                    col.names = c("timestamp", "tz", "serial_state", "antenna", "RFID", "rh_pct", "temp_c"),
+                    colClasses = c("character", "character", "character", "character", "character", "numeric", "numeric")) %>%
+  mutate(timestamp = as.POSIXct(timestamp))
+  return(padar_data)
+}
+# Create a blank list
+output_data = vector("list", length(csv_files))
+# Iterate across all csv files
+for (i in 1:length(csv_files)) {
+  output_data[[i]] = read_padar(csv_files[i])
+}
+# Create final merged dataset
+padar_data = bind_rows(output_data)
+
+View(padar_data)
+
+# Remove duplicate readings
+padar_data_unique = unique(padar_data, by =c("RFID", "antenna", "timestamp", "rh_pct", "temp_c"), na.rm=FALSE)
+View(padar_data_unique)
+
+#===============================================+#
+
+# Separate the rel. humidity and temp variables from RFID data
+
+humid_temp = filter(padar_data, !is.na(rh_pct) | !is.na(temp_c)) %>%
+  select(timestamp, rh_pct, temp_c)
+humid_temp_unique = unique(humid_temp)
+
+rfid_data = filter(padar_data, RFID != "") %>%
+  filter(RFID != "00000000") %>%
+  select(-rh_pct, -temp_c) %>%
+  # Exclude test RFIDs
+  filter(!(RFID %in% c("486F2058", "2205557D", "486F283F", "22053F6C")))
+  arrange(RFID, antenna, timestamp) #%>%
+  
+  # group_by(RFID, antenna) %>%
+  # mutate(timestamp2 = lag(timestamp,1),
+  #        timediff = difftime(timestamp , timestamp2, units="secs")) %>%
+  # select(RFID, antenna, timestamp, timestamp2, timediff, everything()) %>%
+  # ungroup() %>%
+  # data.table()
+
+# Remove duplicate readings
+rfid_data_unique = unique(rfid_data, by =c("RFID", "antenna", "timestamp"))
+#View(rfid_data_unique)
+
+ftable(rfid_data_unique$RFID)
+# Export to Excel
+library(xlsx)
+
+
+rfid_data_unique$timestamp = force_tz(rfid_data_unique$timestamp, tzone = "UTC")
+write.xlsx(rfid_data_unique, "../Private/PADAR RFID data as of 2018_03_14.xlsx")
+
+humid_temp_unique$timestamp = force_tz(humid_temp_unique$timestamp, tzone="UTC")
+write.xlsx(humid_temp_unique, "../Private/PADAR humid_temp as of 2018_03_14.xlsx")
+
+```
+
+```{r compute_duration}
+# If duration > 60 secs then unique visit
+
+rfid_dur <- rfid_data_unique %>%
+  # Remove tz and serialstate
+  select(-tz, - serial_state) %>%
+  arrange(RFID, antenna, timestamp) %>%
+  group_by(RFID, antenna) %>%
+  mutate(time_next = lead(timestamp),
+         timediff = difftime(time_next, timestamp, units="secs")) %>%
+  select(RFID, antenna, timestamp, time_next, timediff, everything()) %>%
+  ungroup() %>%
+  data.table() 
+View(rfid_dur)
+
+# Create a visit_chunk identifier which is essentially a group number by RFID, and antenna
+rfid_dur = rfid_dur %>% 
+  arrange(RFID, antenna, timestamp) %>%
+  data.table()
+setkey(rfid_dur, RFID, antenna)
+
+rfid_dur[ , visit_chunk := .GRP, by = key(rfid_dur)]
+
+rfid_final = rfid_dur %>%
+  group_by(visit_chunk) %>%
+  mutate(num_visits = n(),
+         first =ifelse(row_number() == 1, 1, 0),
+         last = ifelse(row_number() == n(), 1, 0)) %>% 
+  ungroup() %>% 
+  mutate(duration = ifelse(first==1 & last==1 , 0.1, 
+                           ifelse(first==0 & last==1 & lag(timediff) > 60, 0.1, 
+                                  ifelse(timediff > 60 & lag(timediff) <=60, NA, 
+                                         ifelse(timediff > 60 & lag(timediff) > 60, 0.1, timediff)))),
+         duration = ifelse(first==1 & last==0 & timediff > 60, 0.1, duration),
+         duration = ifelse(first==1 & last==0 & timediff > 60, 0.1, duration),
+         timestart = timestamp,
+         timestart = if_else(num_visits == 1, timestamp, timestamp),
+         timeend = if_else(timediff > 60 | is.na(time_next), timestart, time_next),
+         todelete = ifelse(!first & !last & timediff > 60 & lag(timediff) <= 60, 1,0),
+         todelete = ifelse(first==0 & last==1 & is.na(timediff) & lag(timediff) <= 60, 1, todelete),
+         
+         counter = 0,
+         counter = ifelse(first==1, 1, 
+                          ifelse(first==0 & lag(timediff) > 60, 1, 
+                                 ifelse(timestart == timeend, 1, counter))),
+         timestart = force_tz(timestart, tzone="UTC"),
+         timestamp = force_tz(timestamp, tzone="UTC"),
+         time_next = force_tz(time_next, tzone="UTC")
+         ) %>%
+   filter(todelete == 0 ) 
+
+View(rfid_final)
+write.xlsx(rfid_final, "../Private/PADAR RFID durations long 2018_03_14.xlsx")
+
+# Aggregate
+
+agg = rfid_final %>% clean_names() %>%
+  select(-todelete) %>%
+  arrange(rfid, antenna, timestart) %>%
+  mutate(unique_visit = cumsum(counter))
+
+write.xlsx(agg, "../Private/PADAR RFID pre_aggregate 2018_03_14.xlsx")
+View(agg)
+
+aggregated = agg %>%
+  group_by(rfid, antenna, unique_visit) %>%
+  summarize(time_begin = first(timestart),
+            time_end = last(timeend),
+            total_duration = sum(duration)) %>%
+  ungroup() %>%
+  mutate(total_dur2 = difftime(time_end, time_begin, units="secs")) 
+
+write.xlsx(aggregated, "../Private/PADAR RFID total durations 2018_03_14.xlsx")
+View(aggregated)
+
+```
+
